@@ -1,6 +1,4 @@
 
-import ipaddress
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -8,24 +6,21 @@ from pydantic import BaseModel
 
 from backend.app.database import get_scans, save_scan
 from backend.risk_engine.engine import assess_finding
-from backend.scanner.scanner import (
-    validate_target,
-    run_nmap_scan,
-)
+from backend.risk_engine.explanations import explain_finding
+from backend.scanner.scanner import validate_target, run_nmap_scan
 from backend.reports.report_generator import generate_csv_report
+from backend.reports.pdf_generator import generate_pdf_report
 
 
 app = FastAPI(
     title="SecureScope AI",
     description=(
-        "AI-assisted network assessment "
-        "and security reporting system."
+        "AI-Assisted Network Vulnerability Assessment "
+        "and Security Reporting System"
     ),
     version="1.0.0",
 )
 
-
-# Allow the local React frontend to communicate with the API.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -34,7 +29,7 @@ app.add_middleware(
         "http://localhost:5174",
         "http://127.0.0.1:5174",
     ],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -44,11 +39,92 @@ class RealScanRequest(BaseModel):
     target: str
 
 
+def enrich_finding(finding: dict) -> dict:
+    """Add risk assessment, explanation, remediation, and priority."""
+    assessed = assess_finding(finding)
+    return explain_finding(assessed)
+
+
+def get_loopback_target(target: str) -> str:
+    """Restrict real scans to loopback addresses."""
+    try:
+        validated_target = validate_target(target)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid target: {exc}",
+        ) from exc
+
+    if validated_target not in ("127.0.0.1", "::1"):
+        raise HTTPException(
+            status_code=403,
+            detail="Real scans are restricted to 127.0.0.1 or ::1.",
+        )
+
+    return validated_target
+
+
+def build_summary(findings: list[dict]) -> dict:
+    """Count findings by risk level."""
+    levels = [
+        str(item.get("risk_level", "INFO")).upper()
+        for item in findings
+    ]
+
+    return {
+        "total_findings": len(findings),
+        "high": sum(
+            level in ("HIGH", "CRITICAL") for level in levels
+        ),
+        "medium": levels.count("MEDIUM"),
+        "low": levels.count("LOW"),
+        "info": sum(
+            level in ("INFO", "INFORMATIONAL") for level in levels
+        ),
+    }
+
+
+def save_and_return_scan(target: str, findings: list[dict]) -> dict:
+    """Save scan results and return the scan details."""
+    scan_id = save_scan(target, findings)
+
+    return {
+        "id": scan_id,
+        "target": target,
+        "findings": findings,
+        "summary": build_summary(findings),
+    }
+
+
+def find_saved_scan(scan_id: int) -> dict:
+    """Find a saved scan by ID."""
+    scans = get_scans()
+
+    selected_scan = next(
+        (
+            scan for scan in scans
+            if str(scan.get("id")) == str(scan_id)
+        ),
+        None,
+    )
+
+    if selected_scan is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Scan not found",
+        )
+
+    return selected_scan
+
+
 @app.get("/")
-def home():
+def root():
     return {
         "project": "SecureScope AI",
-        "message": "Welcome to SecureScope AI",
+        "message": (
+            "AI-Assisted Network Vulnerability Assessment "
+            "and Security Reporting System"
+        ),
         "status": "running",
     }
 
@@ -59,136 +135,101 @@ def health_check():
 
 
 @app.get("/scans")
-def list_scans():
-    """Return saved assessments."""
+def scan_history():
     return get_scans()
 
 
 @app.post("/scans/demo")
-def run_demo_assessment():
-    """Create a demonstration assessment; no real scan is performed."""
-    target = "demo.local"
-
-    demo_findings = [
+def demo_scan():
+    """Create a sample assessment without running Nmap."""
+    raw_findings = [
         {
             "port": 80,
-            "service": "HTTP",
+            "service": "http",
             "encrypted": False,
         },
         {
             "port": 443,
-            "service": "HTTPS",
+            "service": "https",
             "encrypted": True,
         },
     ]
 
-    try:
-        assessed_findings = [
-            assess_finding(finding)
-            for finding in demo_findings
-        ]
+    findings = [
+        enrich_finding(finding)
+        for finding in raw_findings
+    ]
 
-        save_scan(
-            target=target,
-            findings=assessed_findings,
-        )
-
-        return {
-            "message": "Demo assessment completed successfully",
-            "target": target,
-            "total_findings": len(assessed_findings),
-            "findings": assessed_findings,
-        }
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Demo assessment failed: {exc}",
-        ) from exc
+    return save_and_return_scan("demo-target", findings)
 
 
 @app.post("/scans/real")
-def run_real_assessment(request: RealScanRequest):
-    """
-    Perform a limited Nmap scan of the local computer only.
-    """
+def real_scan(request: RealScanRequest):
+    """Run a scan against the local machine only."""
+    target = get_loopback_target(request.target)
+
     try:
-        target = validate_target(request.target)
-        parsed_ip = ipaddress.ip_address(target)
-
-        # Restrict initial integration testing to loopback.
-        if not parsed_ip.is_loopback:
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "Initial testing is limited to localhost "
-                    "(127.0.0.1 or ::1)."
-                ),
-            )
-
         raw_findings = run_nmap_scan(target)
-
-        assessed_findings = [
-            assess_finding(finding)
-            for finding in raw_findings
-        ]
-
-        save_scan(
-            target=target,
-            findings=assessed_findings,
-        )
-
-        return {
-            "message": "Local assessment completed successfully",
-            "target": target,
-            "total_findings": len(assessed_findings),
-            "findings": assessed_findings,
-        }
-
-    except HTTPException:
-        raise
-
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
             detail=str(exc),
         ) from exc
-
-    except RuntimeError as exc:
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="The scan timed out. Try again later.",
+        ) from exc
+    except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=str(exc),
+            detail=f"Scan failed: {exc}",
         ) from exc
+
+    findings = [
+        enrich_finding(finding)
+        for finding in raw_findings
+    ]
+
+    return save_and_return_scan(target, findings)
 
 
 @app.get("/scans/{scan_id}/report.csv")
 def download_scan_report(scan_id: int):
-    """Download a CSV report for a saved assessment."""
-    scans = get_scans()
+    """Generate a CSV report for a saved scan."""
+    selected_scan = find_saved_scan(scan_id)
 
-    selected_scan = next(
-        (
-            scan
-            for scan in scans
-            if int(scan.get("id", -1)) == scan_id
-        ),
-        None,
-    )
-
-    if selected_scan is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Assessment not found",
+    try:
+        return generate_csv_report(
+            selected_scan["target"],
+            selected_scan["findings"],
         )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not generate CSV report: {exc}",
+        ) from exc
 
-    csv_content = generate_csv_report(selected_scan)
 
-    return Response(
-        content=csv_content,
-        media_type="text/csv",
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="securescope_scan_{scan_id}.csv"'
-            )
-        },
-    )
+@app.get("/scans/{scan_id}/report.pdf")
+def download_scan_pdf(scan_id: int):
+    """Generate and download a PDF report for a saved scan."""
+    selected_scan = find_saved_scan(scan_id)
+
+    try:
+        pdf_bytes = generate_pdf_report(selected_scan)
+
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="securescope-report-{scan_id}.pdf"'
+                )
+            },
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not generate PDF report: {exc}",
+        ) from exc
